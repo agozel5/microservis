@@ -1,0 +1,281 @@
+import sys
+import threading
+import datetime
+import psutil
+import sqlite3
+import os
+import platform
+from collections import defaultdict
+from scapy.all import sniff, IP, TCP, UDP, ICMP, ARP, DNSQR, conf
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QListWidget,
+    QHBoxLayout, QFileDialog, QComboBox, QMessageBox, QCheckBox
+)
+from PyQt5.QtCore import pyqtSignal, QObject
+from PyQt5.QtGui import QFont, QIcon
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+class PacketSniffer(QObject):
+    packet_detected = pyqtSignal(str)
+    stats_updated = pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self.sniffing = False
+        self.interface = None
+        self.alert_only = False
+        self.db_path = "ids_logs.db"
+        self.create_db()
+        self.traffic_stats = defaultdict(int)
+
+    def create_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                timestamp TEXT,
+                event TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def log_to_db(self, event):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO logs (timestamp, event) VALUES (?, ?)", (timestamp, event))
+        conn.commit()
+        conn.close()
+
+    def set_interface(self, iface):
+        self.interface = iface
+
+    def set_alert_filter(self, alert_only):
+        self.alert_only = alert_only
+
+    def start_sniffing(self):
+        self.sniffing = True
+        threading.Thread(target=self.sniff_packets, daemon=True).start()
+
+    def stop_sniffing(self):
+        self.sniffing = False
+
+    def sniff_packets(self):
+        sniff(prn=self.process_packet, store=False, stop_filter=lambda x: not self.sniffing, iface=self.interface)
+
+    def process_packet(self, pkt):
+        log = ""
+        alert = False
+
+        if ARP in pkt:
+            if pkt[ARP].op == 1 and pkt[ARP].psrc == pkt[ARP].pdst:
+                alert = True
+                log = f"[ALERTE] Tentative ARP spoofing: {pkt[ARP].hwsrc}"
+
+        elif pkt.haslayer(DNSQR):
+            dns = pkt[DNSQR]
+            log = f"[INFO] Requête DNS: {dns.qname.decode()}"
+
+        elif IP in pkt:
+            src = pkt[IP].src
+            dst = pkt[IP].dst
+
+            if ICMP in pkt:
+                icmp_type = pkt[ICMP].type
+                icmp_code = pkt[ICMP].code
+                if icmp_type == 8:
+                    log = f"ICMP Echo Request (ping) de {src} vers {dst}"
+                elif icmp_type == 0:
+                    log = f"ICMP Echo Reply de {src} vers {dst}"
+                else:
+                    log = f"ICMP type {icmp_type} code {icmp_code} de {src} vers {dst}"
+
+            elif TCP in pkt:
+                sport = pkt[TCP].sport
+                dport = pkt[TCP].dport
+                flags = pkt[TCP].flags
+                log = f"TCP {src}:{sport} -> {dst}:{dport}, Flags={flags}, Len={pkt[IP].len}"
+                if flags == "S":
+                    alert = True
+                    log = f"[ALERTE] Scan SYN de {src}:{sport} vers {dst}:{dport}"
+
+            elif UDP in pkt:
+                sport = pkt[UDP].sport
+                dport = pkt[UDP].dport
+                log = f"UDP {src}:{sport} -> {dst}:{dport}, Len={pkt[IP].len}"
+
+            else:
+                log = f"IP {src} -> {dst}, proto={pkt[IP].proto}, Len={pkt[IP].len}"
+
+        if log:
+            if self.alert_only and not alert:
+                return
+            self.packet_detected.emit(log)
+            self.log_to_db(log)
+
+            self.traffic_stats['TCP'] += 1 if TCP in pkt else 0
+            self.traffic_stats['UDP'] += 1 if UDP in pkt else 0
+            self.traffic_stats['ICMP'] += 1 if ICMP in pkt else 0
+            self.traffic_stats['ARP'] += 1 if ARP in pkt else 0
+            self.traffic_stats['DNS'] += 1 if pkt.haslayer(DNSQR) else 0
+            self.stats_updated.emit(dict(self.traffic_stats))
+
+
+class StatsCanvas(FigureCanvas):
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(5, 2), tight_layout=True)
+        self.ax = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self.setParent(parent)
+
+    def update_chart(self, stats):
+        self.ax.clear()
+        if stats:
+            labels = list(stats.keys())
+            values = list(stats.values())
+            self.ax.bar(labels, values, color='cyan')
+            self.ax.set_title("Statistiques de trafic")
+            self.ax.set_ylabel("Nombre de paquets")
+            self.ax.set_facecolor('#2e2e2e')
+            self.fig.patch.set_facecolor('#2e2e2e')
+            self.ax.tick_params(axis='x', colors='white')
+            self.ax.tick_params(axis='y', colors='white')
+            self.ax.title.set_color('white')
+            self.ax.yaxis.label.set_color('white')
+        self.draw()
+
+
+class IDSApp(QWidget):
+    export_done = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IDS - Système de détection d'intrusions")
+        self.setGeometry(200, 100, 1000, 750)
+        self.setStyleSheet("background-color: #2e2e2e; color: white;")
+        self.setWindowIcon(QIcon.fromTheme("security"))
+
+        self.log_entries = []
+
+        title = QLabel("IDS Entreprise - Analyse réseau avancée")
+        title.setFont(QFont("Arial", 18, QFont.Bold))
+        title.setStyleSheet("color: #00FFFF;")
+
+        self.log_list = QListWidget()
+        self.log_list.setStyleSheet("background-color: #1e1e1e; color: white;")
+
+        self.interface_select = QComboBox()
+        self.interface_select.setStyleSheet("background-color: #444; color: white;")
+        self.iface_map = {}
+
+        for iface, addrs in psutil.net_if_addrs().items():
+            ip = None
+            for addr in addrs:
+                if addr.family.name == 'AF_INET':
+                    ip = addr.address
+                    break
+            label = f"{iface} ({ip})" if ip else f"{iface} (no IP)"
+            self.iface_map[label] = iface
+            self.interface_select.addItem(label)
+
+        self.start_btn = QPushButton("Démarrer")
+        self.stop_btn = QPushButton("Arrêter")
+        self.export_btn = QPushButton("Exporter les logs")
+        for btn in [self.start_btn, self.stop_btn, self.export_btn]:
+            btn.setStyleSheet("background-color: #005f5f; color: white; padding: 6px;")
+
+        self.stop_btn.setEnabled(False)
+        self.alert_only_checkbox = QCheckBox("Afficher uniquement les alertes")
+        self.alert_only_checkbox.setStyleSheet("color: #CCCCCC")
+
+        self.stats_chart = StatsCanvas(self)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addWidget(self.interface_select)
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.stop_btn)
+        btn_layout.addWidget(self.export_btn)
+
+        layout = QVBoxLayout()
+        layout.addWidget(title)
+        layout.addLayout(btn_layout)
+        layout.addWidget(self.alert_only_checkbox)
+        layout.addWidget(self.stats_chart)
+        layout.addWidget(self.log_list)
+        self.setLayout(layout)
+
+        self.start_btn.clicked.connect(self.start_sniffer)
+        self.stop_btn.clicked.connect(self.stop_sniffer)
+        self.export_btn.clicked.connect(self.export_logs)
+
+        self.export_done.connect(self.show_export_message)
+
+        self.sniffer = PacketSniffer()
+        self.sniffer.packet_detected.connect(self.add_event)
+        self.sniffer.stats_updated.connect(self.stats_chart.update_chart)
+
+    def start_sniffer(self):
+        label = self.interface_select.currentText()
+        iface = self.iface_map.get(label)
+        if iface:
+            self.sniffer.set_interface(iface)
+            self.sniffer.set_alert_filter(self.alert_only_checkbox.isChecked())
+            self.sniffer.start_sniffing()
+            self.add_event("[INFO] Surveillance démarrée sur " + label)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+        else:
+            QMessageBox.warning(self, "Erreur", "Aucune interface réseau sélectionnée.")
+
+    def stop_sniffer(self):
+        self.sniffer.stop_sniffing()
+        self.add_event("[INFO] Surveillance stoppée.")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def add_event(self, event):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        full_event = f"[{timestamp}] {event}"
+        self.log_entries.append(full_event)
+        self.log_list.addItem(full_event)
+        self.log_list.scrollToBottom()
+
+        if "[ALERTE]" in event:
+            self.alert_notification()
+
+    def alert_notification(self):
+        if platform.system() == "Windows":
+            import winsound
+            winsound.MessageBeep()
+        else:
+            os.system('paplay /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga 2>/dev/null &')
+
+    def export_logs(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Exporter les logs", "logs_ids.txt", "Text Files (*.txt)")
+        if not path:
+            return
+
+        def write_file():
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(self.log_entries))
+                self.export_done.emit(path)
+            except Exception as e:
+                self.export_done.emit("ERROR:"+str(e))
+
+        threading.Thread(target=write_file, daemon=True).start()
+
+    def show_export_message(self, path):
+        if path.startswith("ERROR:"):
+            QMessageBox.warning(self, "Erreur export", f"Erreur lors de l'export des logs :\n{path[6:]}")
+        else:
+            QMessageBox.information(self, "Exportation réussie", f"Logs enregistrés dans :\n{path}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = IDSApp()
+    window.show()
+    sys.exit(app.exec())
